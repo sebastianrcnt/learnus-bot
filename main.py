@@ -1,10 +1,10 @@
 import hashlib
 import subprocess
 import os
+import logging
 import threading
 import time
 import argparse
-import logging
 import dotenv
 
 from typing import List
@@ -18,7 +18,7 @@ dotenv.load_dotenv(".env")
 
 AUTH_INFO = {
     "username": os.environ.get("LEARNUS_USERNAME"),
-    "password": os.environ.get("LEARNUS_PASSWORD")
+    "password": os.environ.get("LEARNUS_PASSWORD"),
 }
 
 from selenium import webdriver
@@ -29,13 +29,9 @@ from selenium.common.exceptions import (
     UnexpectedAlertPresentException,
 )
 
-logging.basicConfig(
-    level="INFO",
-    format="%(message)s [%(threadName)s]",
-    datefmt="[%X]",
-    handlers=[RichHandler(rich_tracebacks=True)],
-)
-
+logger = logging.getLogger(__name__)
+logger.addHandler(RichHandler(rich_tracebacks=True))
+logger.setLevel("DEBUG")
 
 # types
 @dataclass
@@ -62,8 +58,8 @@ def delete_elements(driver, selector: str):
     )
 
 
-def find_all_vods(driver, course_link: str):
-    driver.get(course_link)
+def get_all_vods_under_course(driver, course: Course) -> List[Vod]:
+    driver.get(course.link)
     vods: List[Vod] = []
 
     # get all elements with .course-box
@@ -71,18 +67,10 @@ def find_all_vods(driver, course_link: str):
 
     for vod_element in vod_elements:
         # remove '.accesshide' element
-        driver.execute_script(
-            """
-            var elements = document.querySelectorAll('.accesshide');
-            for (var i = 0; i < elements.length; i++) {
-                elements[i].parentNode.removeChild(elements[i]);
-            }
-        """
-        )
+        delete_elements(driver, ".accesshide")
         vod_name = vod_element.find_element(By.CSS_SELECTOR, "span.instancename").text
         vod_link = vod_element.find_element(By.CSS_SELECTOR, "a").get_attribute("href")
 
-        logging.info(f"found vod: {vod_name}, link: {vod_link}")
         try:
             vod_complete_icon = vod_element.find_element(By.CSS_SELECTOR, "img.icon")
             is_complete = vod_complete_icon.get_attribute("src").endswith(
@@ -91,13 +79,15 @@ def find_all_vods(driver, course_link: str):
             vods.append(
                 Vod(
                     vod_name,
-                    vod_link.replace("view.php", "viewer.php"),
+                    vod_link.replace("view.php", "viewer.php"), # view.php seems to be automatically redirected back to home page, so use viewer.php
                     is_complete,
                 )
             )
+            logger.debug(f"\tfound vod: {vod_name} at {vod_link}, is_complete: {is_complete}")
         except NoSuchElementException as e:
             ...
 
+    # sometimes, the same vod is repeated, so do remove duplicates by using link as key
     vod_links_set = set()
     vods = [
         v for v in vods if not (v.link in vod_links_set or vod_links_set.add(v.link))
@@ -107,8 +97,9 @@ def find_all_vods(driver, course_link: str):
 
 
 def parse_time_to_secs(time_str: str) -> int:
+    """splits the time string (hh:mm:ss, hh/mm is optional) and returns the time in seconds"""
     time_str_splitted = time_str.split(":")
-    logging.info("timestr", time_str, time_str_splitted)
+    logger.info("timestr", time_str, time_str_splitted)
 
     if len(time_str_splitted == 1):
         return int(time_str_splitted[0])
@@ -124,7 +115,7 @@ def parse_time_to_secs(time_str: str) -> int:
         raise ValueError(f"time_str is not in the correct format: {time_str}")
 
 
-def get_current_progress(driver) -> float:
+def _vod_get_current_progress(driver) -> float:
     progress_element = driver.find_element(
         By.CSS_SELECTOR, ".vjs-progress-control div.vjs-progress-holder"
     )
@@ -139,7 +130,7 @@ def get_current_progress(driver) -> float:
     return (float(value_now) - float(value_min)) / (float(value_max) - float(value_min))
 
 
-def set_to_highest_playback_rate(driver) -> float:
+def _vod_set_to_highest_playback_rate(driver) -> float:
     # click the playback rate button
     _vjs_playback_rate_btn = driver.find_element(
         By.CSS_SELECTOR, "button.vjs-playback-rate"
@@ -153,16 +144,16 @@ def set_to_highest_playback_rate(driver) -> float:
     vjs_playback_rate_elements[0].click()
 
 
-def confirm_alert_if_exists(driver) -> None:
+def _vod_confirm_alert_if_exists(driver):
     try:
         alert = driver.switch_to.alert
         alert.accept()
-        logging.info(f"alert: {alert.text}")
+        logger.info(f"alert: {alert.text}")
     except NoAlertPresentException:
         ...
 
 
-def click_play_button(driver) -> None:
+def _vod_click_play_btn(driver) -> None:
     play_btn = driver.find_element(By.CSS_SELECTOR, "#my-video > button")
     play_btn.click()
 
@@ -170,39 +161,43 @@ def click_play_button(driver) -> None:
 def play_vod(driver, vod: Vod, course: Course, progress: Progress):
     driver.get(vod.link)
     time.sleep(1)
-    confirm_alert_if_exists(driver)
+    _vod_confirm_alert_if_exists(driver)
     time.sleep(1)
-    click_play_button(driver)
+    _vod_click_play_btn(driver)
     time.sleep(1)
-    set_to_highest_playback_rate(driver)
+    _vod_set_to_highest_playback_rate(driver)
     time.sleep(1)
 
-    logging.info(f"for course: {course.title}, playing vod: {vod.name}")
-    task1 = progress.add_task(f"at {threading.current_thread().name}>, playing vod {vod.name}", total=10000)
+    task1 = progress.add_task(
+        f"at {threading.current_thread().name}>, playing vod {vod.name}", total=10000
+    )
 
     while True:
         time.sleep(1)
-        current_progress = get_current_progress(driver)
+        current_progress = _vod_get_current_progress(driver)
         progress.update(task1, completed=current_progress * 10000)
 
         if current_progress > 0.995:
-            logging.info(f"reached 99.5% of the video, exiting...")
+            logger.info(f"reached 99.5% of the video, exiting...")
             break
 
     time.sleep(1)
 
 
-def get_video_m3u8_link(driver, vod: Vod):
+def _vod_get_video_m3u8_link(driver, vod: Vod):
     try:
         driver.get(vod.link)
         time.sleep(3)
-        m3u8_link = driver.find_element(By.CSS_SELECTOR, "video source").get_attribute("src")
+        m3u8_link = driver.find_element(By.CSS_SELECTOR, "video source").get_attribute(
+            "src"
+        )
     except UnexpectedAlertPresentException:
-        confirm_alert_if_exists(driver)
+        _vod_confirm_alert_if_exists(driver)
         time.sleep(1)
-    
 
-    m3u8_link = driver.find_element(By.CSS_SELECTOR, "video source").get_attribute("src")
+    m3u8_link = driver.find_element(By.CSS_SELECTOR, "video source").get_attribute(
+        "src"
+    )
     return m3u8_link
 
 
@@ -245,17 +240,22 @@ def build_driver(headless: bool = True):
     if headless:
         options.add_argument("--headless")
     driver = webdriver.Firefox(options=options)
-    logging.info("webdriver started")
     driver.execute_script(
         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     )
     return driver
 
 
-def thread_play_vod(course: Course, vod: Vod, progress: Progress, headless: bool):
+def play_vod_in_seperate_thread(course: Course, vod: Vod, progress: Progress, headless: bool):
+    logger.info(f"playing vod: {vod.name} in a seperate thread, thread: {threading.current_thread().name}")
+    logger.debug("building driver...")
     driver = build_driver(headless=headless)
+    logger.debug("doing login...")
     do_login(driver, AUTH_INFO["username"], AUTH_INFO["password"])
+    logger.debug(f"completed login")
+    logger.debug(f"playing vod: {vod.name} at course {course.title}")
     play_vod(driver, vod, course, progress)
+    logger.debug(f"completed playing vod: {vod.name}")
     driver.close()
 
 
@@ -265,63 +265,70 @@ def main(
     download: bool = False,
 ):
     try:
-        result = subprocess.run(['pgrep -l firefox'], shell=True, check=True)
-        logging.info(f"finding running firefox instances...: {result.stdout}")
-        logging.info(f"killing all firefox instances...")
-        result = subprocess.run(['pkill firefox'], shell=True, check=True)
-        logging.info(f"result: {result.stdout}")
+        result = subprocess.run(["pgrep -l firefox"], shell=True, check=True)
+        logger.info(f"finding running firefox instances...: {result.stdout}")
+        logger.info(f"killing all firefox instances...")
+        result = subprocess.run(["pkill firefox"], shell=True, check=True)
+        logger.info(f"result: {result.stdout}")
     except Exception as e:
-        logging.warning(f"error while killing firefox: {e}")
-        
-    driver = build_driver(headless=headless)
-    logging.info("doing login...")
-    do_login(driver, AUTH_INFO["username"], AUTH_INFO["password"])
-    logging.info("completed login")
+        logger.warning(f"error while killing firefox: {e}")
 
-    logging.info("getting all courses")
+    driver = build_driver(headless=headless)
+    logger.info("doing login...")
+    do_login(driver, AUTH_INFO["username"], AUTH_INFO["password"])
+    logger.info("completed login")
+
+    logger.info("getting all courses")
     courses = get_all_courses(driver)
 
-    logging.info(f"found {len(courses)} courses")
+    logger.info(f"found {len(courses)} courses")
 
     for i in range(len(courses)):
         course = courses[i]
-        logging.info(f"\tcourse<{i}>: {course.title}")
-
+        logger.debug(f"\tcourse<{i}>: {course.title}")
+    
     non_completed_vods: List[Vod] = []
     all_vods: List[Vod] = []
 
     for course in courses:
-        vods = find_all_vods(driver, course.link)
+        vods = get_all_vods_under_course(driver, course)
         for vod in vods:
             all_vods.append(vod)
             if not vod.is_complete:
                 non_completed_vods.append(vod)
-    
-    logging.info(f"found {len(non_completed_vods)} non-completed vods")
-    logging.info(f"closing driver...")
+
+    logger.info(f"found {len(non_completed_vods)} non-completed vods, and {len(all_vods)} vods in total")
 
     if download:
         for vod in all_vods:
-            logging.info(f"downloading vod: {vod.name}")
-            m3u8_link = get_video_m3u8_link(driver, vod)
-            filename = hashlib.md5((course.title + vod.name).encode()).hexdigest() + ".mp4"
+            logger.info(f"downloading vod: {vod.name}")
+            m3u8_link = _vod_get_video_m3u8_link(driver, vod)
+            filename = (
+                hashlib.md5((course.title + vod.name).encode()).hexdigest() + ".mp4"
+            )
 
             if os.path.exists(filename):
-                logging.info(f"file already exists: {filename}")
+                logger.info(f"file already exists: {filename}")
                 continue
 
             from m3u8downloader.main import M3u8Downloader
+
             downloader = M3u8Downloader(m3u8_link, filename, tempdir=".", poolsize=5)
             downloader.start()
 
+    logger.info(f"closing driver")
     driver.close()
 
+
+    logger.info(f"start playing non-completed vods")
     with Progress() as progress:
-        with ThreadPoolExecutor(max_workers=max_threads, thread_name_prefix="vod-streaming-thread") as executor:
+        with ThreadPoolExecutor(
+            max_workers=max_threads, thread_name_prefix="vod-streaming-thread"
+        ) as executor:
             futures = []
             for vod in non_completed_vods:
                 future = executor.submit(
-                    thread_play_vod, course, vod, progress, headless
+                    play_vod_in_seperate_thread, course, vod, progress, headless
                 )
                 futures.append(future)
 
@@ -351,7 +358,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    try: 
+    try:
         main(
             headless=args.headless,
             max_threads=args.max_threads,
@@ -359,6 +366,6 @@ if __name__ == "__main__":
         )
         os.system("pkill firefox")
     except KeyboardInterrupt as e:
-        logging.info("exiting...")
+        logger.info("exiting...")
         os.system("pkill firefox")
         raise e
